@@ -16,13 +16,18 @@
   #card { position:fixed; left:12px; right:12px; bottom:16px; background:rgba(20,20,20,0.92);
           border-radius:16px; padding:16px; transform:translateY(140%); transition:transform .3s ease; z-index:6; }
   #card.show { transform:translateY(0); }
-  #card.high { background:rgba(180,40,40,0.95); }
+  #card.keep { background:rgba(21,94,52,0.95); }
+  #card.discard { background:rgba(153,27,27,0.96); }
+  #cVerdict { font-size:24px; font-weight:800; margin-bottom:4px; letter-spacing:0.5px; }
   #card h2 { margin:0 0 6px; font-size:20px; }
   #card .row { font-size:14px; opacity:0.85; margin:2px 0; }
   #card .value { font-weight:700; font-size:15px; margin-top:8px; }
   #flash { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; }
   #flash.go { animation: flashAnim 0.25s ease; }
   @keyframes flashAnim { 0%{opacity:0.9;} 100%{opacity:0;} }
+  #edge { position:fixed; inset:0; pointer-events:none; z-index:8; border:0 solid transparent; transition:border-width .08s ease; }
+  #edge.keep { border:16px solid #22c55e; }
+  #edge.discard { border:16px solid #ef4444; }
   #setup { position:fixed; inset:0; background:#111; display:flex; flex-direction:column;
            justify-content:center; align-items:center; padding:24px; z-index:10; }
   #setup h1 { font-size:22px; margin-bottom:16px; }
@@ -58,18 +63,24 @@
   #history header { display:flex; align-items:center; justify-content:space-between;
                     padding:16px; border-bottom:1px solid rgba(255,255,255,0.1); }
   #history header h2 { margin:0; font-size:18px; }
+  #histCounts { font-size:13px; font-weight:400; opacity:0.7; }
   #history header button { background:none; border:none; color:#fff; font-size:26px; line-height:1; }
   #histList { flex:1; overflow-y:auto; padding:8px 12px 24px; }
   #histList .empty { opacity:0.5; text-align:center; margin-top:40px; }
   .hItem { display:flex; gap:12px; padding:10px; margin-bottom:8px; border-radius:12px;
            background:rgba(255,255,255,0.06); align-items:center; }
-  .hItem.high { background:rgba(180,40,40,0.35); }
+  .hItem.keep { background:rgba(21,94,52,0.30); }
+  .hItem.discard { background:rgba(153,27,27,0.32); }
   .hItem .thumbs { display:flex; gap:4px; flex:none; }
   .hItem .thumbs img { width:40px; height:56px; object-fit:cover; border-radius:6px; }
   .hItem .info { flex:1; min-width:0; }
   .hItem .info .t { font-weight:600; font-size:15px; }
   .hItem .info .s { font-size:13px; opacity:0.8; margin-top:2px; }
-  .hItem .tag { font-size:12px; font-weight:700; color:#fca5a5; margin-top:3px; }
+  .hItem .verdict { font-size:13px; font-weight:700; margin-top:4px; display:flex; align-items:center; gap:6px; }
+  .hItem .verdict.keep { color:#4ade80; }
+  .hItem .verdict.discard { color:#f87171; }
+  .hItem .verdict .grade { display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px;
+                           padding:0 5px; border-radius:6px; background:rgba(255,255,255,0.15); color:#fff; font-size:13px; }
 </style>
 </head>
 <body>
@@ -77,11 +88,13 @@
     <h1>🔑 Fleek Sort</h1>
     <input id="apiKeyInput" type="password" placeholder="Paste OpenRouter API key" autocomplete="off">
     <button id="startBtn">Start camera</button>
+    <p style="margin-top:14px;font-size:13px;opacity:0.7;text-align:center;">🔊 Turn the ringer/silent switch ON so the keep/discard sounds play.</p>
   </div>
   <video id="video" autoplay playsinline muted></video>
   <canvas id="capCanvas" style="display:none"></canvas>
   <canvas id="diffCanvas" width="80" height="60" style="display:none"></canvas>
   <div id="flash"></div>
+  <div id="edge"></div>
   <div id="status">starting camera…</div>
   <button id="pauseBtn">⏸ Pause</button>
   <button id="recalibBtn">⟲ Set empty table</button>
@@ -94,15 +107,16 @@
   </div>
   <div id="history">
     <header>
-      <h2>Scanned items</h2>
+      <h2>Scanned items <span id="histCounts"></span></h2>
       <button id="histClose">×</button>
     </header>
     <div id="histList"><div class="empty">No items scanned yet.</div></div>
   </div>
   <div id="card">
+    <div id="cVerdict"></div>
     <h2 id="cCategory"></h2>
+    <div class="row" id="cGrade"></div>
     <div class="row" id="cPattern"></div>
-    <div class="row" id="cCondition"></div>
     <div class="row" id="cBrand"></div>
     <div class="row value" id="cValue"></div>
   </div>
@@ -117,7 +131,7 @@ const card = document.getElementById('card');
 const flashEl = document.getElementById('flash');
 
 const MOTION_THRESH = 12;      // avg per-pixel diff below this = "still"
-const STABLE_NEEDED = 5;       // consecutive still checks before firing
+const STABLE_NEEDED = 8;       // consecutive still checks before firing (~1.2s)
 const COOLDOWN_MS = 2500;
 const CHECK_INTERVAL_MS = 150;
 const PRESENCE_THRESH = 16;    // still frame this far from the empty table = an item is present
@@ -142,6 +156,18 @@ const badge = document.getElementById('badge');
 const badgeCount = document.getElementById('badgeCount');
 const historyEl = document.getElementById('history');
 const histList = document.getElementById('histList');
+const histCounts = document.getElementById('histCounts');
+const edge = document.getElementById('edge');
+let keepCount = 0, discardCount = 0;
+
+// Grade decides the verdict: A/B/C = keep, below C (D) = discard. Falls back to
+// "C" (keep) if the model didn't return a usable grade.
+function verdictOf(r) {
+  let g = String(r.grade || "").trim().toUpperCase();
+  if (!["A", "B", "C", "D"].includes(g)) g = "C";
+  return { grade: g, action: g === "D" ? "discard" : "keep", isHigh: r.resale_value_signal === "high" };
+}
+
 badge.addEventListener('click', () => historyEl.classList.add('show'));
 document.getElementById('histClose').addEventListener('click', () => historyEl.classList.remove('show'));
 
@@ -218,6 +244,7 @@ startBtn.addEventListener('click', () => {
   apiKey = apiKeyInput.value.trim();
   if (!apiKey) { alert('Paste your OpenRouter API key first'); return; }
   localStorage.setItem('openrouter_key', apiKey);
+  ensureAudio();                       // unlock sound within this user gesture (iOS)
   setupEl.classList.add('hidden');
   initCamera().catch(e => { statusEl.textContent = "camera error: " + e.message; });
 });
@@ -237,37 +264,36 @@ async function initCamera() {
   setInterval(checkMotion, CHECK_INTERVAL_MS);
 }
 
-function beep(highValue) {
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.connect(gain); gain.connect(ctx.destination);
-  osc.frequency.value = highValue ? 1046.5 : 660;
-  gain.gain.setValueAtTime(0.3, ctx.currentTime);
-  osc.start();
-  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + (highValue ? 0.6 : 0.15));
-  osc.stop(ctx.currentTime + (highValue ? 0.65 : 0.2));
+// One shared AudioContext, unlocked on a user gesture (iOS keeps new contexts
+// suspended until then, and won't play sound created inside timers otherwise).
+let audioCtx = null;
+function ensureAudio() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch (e) {}
 }
 
-function doubleBeepHigh() {
-  beep(true);
-  setTimeout(() => beep(true), 350);
+function tone(freq, startOffset, dur, type, peak) {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime + startOffset;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || "sine";
+  osc.frequency.setValueAtTime(freq, t0);
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  gain.gain.setValueAtTime(0.0001, t0);
+  gain.gain.exponentialRampToValueAtTime(peak || 0.3, t0 + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.05);
 }
 
-function flipCueBeep() {
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  [880, 990].forEach((freq, i) => {
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain); gain.connect(ctx.destination);
-    osc.frequency.value = freq;
-    const t = ctx.currentTime + i * 0.12;
-    gain.gain.setValueAtTime(0.25, t);
-    osc.start(t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
-    osc.stop(t + 0.12);
-  });
-}
+// KEEP = rising chime · DISCARD = low buzzer · high value = sparkle · flip = quick up-blip
+function keepSound()    { ensureAudio(); tone(659, 0, 0.16, "sine", 0.30);   tone(988, 0.15, 0.30, "sine", 0.30); }
+function discardSound() { ensureAudio(); tone(196, 0, 0.22, "square", 0.22); tone(147, 0.20, 0.34, "square", 0.22); }
+function highEmphasis() { ensureAudio(); tone(1319, 0, 0.16, "sine", 0.28);  tone(1319, 0.20, 0.22, "sine", 0.28); }
+function flipCueBeep()  { ensureAudio(); tone(880, 0, 0.10, "sine", 0.25);   tone(990, 0.12, 0.12, "sine", 0.25); }
 
 function checkMotion() {
   // Keep analyzing the scene at all times. We do NOT stop for an in-flight Gemini
@@ -444,20 +470,25 @@ function makeThumb() {
 }
 
 function addToHistory(r, thumbFront, thumbBack) {
-  const isHigh = r.resale_value_signal === "high";
-  history.unshift({ r, thumbFront, thumbBack, isHigh });
+  const v = verdictOf(r);
+  history.unshift({ r, thumbFront, thumbBack, v });
+  if (v.action === "keep") keepCount++; else discardCount++;
   badgeCount.textContent = history.length;
+  histCounts.textContent = `(${keepCount} keep · ${discardCount} discard)`;
 
   if (history.length === 1) histList.innerHTML = "";
   const el = document.createElement('div');
-  el.className = "hItem" + (isHigh ? " high" : "");
+  el.className = "hItem " + v.action;
   const brand = r.brand && r.brand !== "unknown" ? r.brand : "";
-  const meta = [brand, r.condition, r.pattern_color].filter(Boolean).join(" · ");
+  const meta = [brand, r.pattern_color].filter(Boolean).join(" · ");
+  const gradeChip = v.grade === "D" ? "✗" : v.grade;
+  const verdictLabel = (v.action === "keep" ? "KEEP" : "DISCARD") + (v.isHigh ? " · ⭐" : "");
   el.innerHTML =
     `<div class="thumbs"><img src="${thumbFront}" alt=""><img src="${thumbBack}" alt=""></div>` +
-    `<div class="info"><div class="t">${escapeHtml(r.category || "item")}</div>` +
-    `<div class="s">${escapeHtml(meta)}</div>` +
-    (isHigh ? `<div class="tag">⭐ HIGH VALUE — ${escapeHtml(r.value_reasoning || "")}</div>` : "") +
+    `<div class="info">` +
+      `<div class="t">${escapeHtml(r.category || "item")}</div>` +
+      `<div class="s">${escapeHtml(meta)}</div>` +
+      `<div class="verdict ${v.action}"><span class="grade">${gradeChip}</span> ${verdictLabel}</div>` +
     `</div>`;
   histList.insertBefore(el, histList.firstChild);
 }
@@ -466,9 +497,14 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 }
 
-const PROMPT = `You are looking at two photos of the SAME garment from a live camera feed above a charity donation intake table — the item was flipped between shots, so the first photo shows one side and the second shows the other. Using both photos together, identify:
+const PROMPT = `You are looking at two photos of the SAME garment from a live camera feed above a charity donation intake table — the item was flipped between shots, so the first photo shows one side and the second shows the other. Consider flaws visible in EITHER photo. Using both photos together, identify:
 - category
-- condition: one of "new", "like new", "good", "fair", "poor"
+- grade: assign exactly ONE grade using this rubric:
+    "A" = Almost new with light wear. Looks close to new with minimal wear; any marks are light and typically removable.
+    "B" = Gently used. Light everyday wear with minor flaws that don't affect use — may include small stains, holes, or missing buttons/zips that are easy to repair.
+    "C" = Visible wear with stains. Noticeable wear and visible flaws but still wearable as-is — larger stains, tears, or repairs needed.
+    "D" = Below grade C. Not wearable as-is: heavy damage, large tears/holes, severe or widespread staining, or otherwise beyond simple repair.
+- grade_reason: one short sentence justifying the grade (mention the specific flaws and which photo, or "no visible flaws").
 - brand: only if a visible logo/tag is present in either photo, else "unknown"
 - brand_evidence: what you saw and in which photo, or "none"
 - pattern_color: short description
@@ -476,7 +512,7 @@ const PROMPT = `You are looking at two photos of the SAME garment from a live ca
 - value_reasoning: one short sentence, or "none"
 
 Return ONLY JSON, no markdown fences:
-{"category":"...", "condition":"...", "brand":"...", "brand_evidence":"...", "pattern_color":"...", "resale_value_signal":"...", "value_reasoning":"..."}`;
+{"category":"...", "grade":"A|B|C|D", "grade_reason":"...", "brand":"...", "brand_evidence":"...", "pattern_color":"...", "resale_value_signal":"...", "value_reasoning":"..."}`;
 
 async function callGemini(dataUrl1, dataUrl2) {
   const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -505,18 +541,25 @@ async function callGemini(dataUrl1, dataUrl2) {
 }
 
 function showCard(r) {
+  const v = verdictOf(r);
+  const gradeLabel = v.grade === "D" ? "Below grade C" : ("Grade " + v.grade);
+  document.getElementById('cVerdict').textContent = v.action === "keep" ? "✅ KEEP" : "🗑️ DISCARD";
   document.getElementById('cCategory').textContent = r.category || "item";
+  document.getElementById('cGrade').textContent = gradeLabel + (r.grade_reason ? " — " + r.grade_reason : "");
   document.getElementById('cPattern').textContent = r.pattern_color || "";
-  document.getElementById('cCondition').textContent = "Condition: " + (r.condition || "?");
   document.getElementById('cBrand').textContent = "Brand: " + (r.brand || "unknown");
-  const isHigh = r.resale_value_signal === "high";
-  const valueEl = document.getElementById('cValue');
-  valueEl.textContent = isHigh ? ("⭐ HIGH VALUE — " + r.value_reasoning) : "";
-  card.className = isHigh ? "show high" : "show";
-  beep(false);
-  if (isHigh) doubleBeepHigh();
+  document.getElementById('cValue').textContent = v.isHigh ? ("⭐ HIGH VALUE — " + (r.value_reasoning || "")) : "";
+  card.className = "show " + v.action;
 
-  setTimeout(() => card.classList.remove('show'), 4000);
+  // audio — the primary hands-free signal, fired once after the second side
+  if (v.action === "keep") { keepSound(); if (v.isHigh) setTimeout(highEmphasis, 420); }
+  else discardSound();
+
+  // glanceable full-screen colored border
+  edge.className = v.action;
+  setTimeout(() => { edge.className = ""; }, 1300);
+
+  setTimeout(() => card.classList.remove('show'), 4500);
 }
 </script>
 </body>
