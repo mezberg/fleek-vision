@@ -68,7 +68,7 @@
   #histList { flex:1; overflow-y:auto; padding:8px 12px 24px; }
   #histList .empty { opacity:0.5; text-align:center; margin-top:40px; }
   .hItem { display:flex; gap:12px; padding:10px; margin-bottom:8px; border-radius:12px;
-           background:rgba(255,255,255,0.06); align-items:center; }
+           background:rgba(255,255,255,0.06); align-items:flex-start; }
   .hItem.keep { background:rgba(21,94,52,0.30); }
   .hItem.discard { background:rgba(153,27,27,0.32); }
   .hItem .thumbs { display:flex; gap:4px; flex:none; }
@@ -76,6 +76,8 @@
   .hItem .info { flex:1; min-width:0; }
   .hItem .info .t { font-weight:600; font-size:15px; }
   .hItem .info .s { font-size:13px; opacity:0.8; margin-top:2px; }
+  .hItem .info .reason { font-size:12px; opacity:0.65; margin-top:2px; line-height:1.35; }
+  .hItem .info .value { font-size:12px; color:#fbbf24; margin-top:2px; line-height:1.35; }
   .hItem .verdict { font-size:13px; font-weight:700; margin-top:4px; display:flex; align-items:center; gap:6px; }
   .hItem .verdict.keep { color:#4ade80; }
   .hItem .verdict.discard { color:#f87171; }
@@ -487,6 +489,7 @@ function addToHistory(r, thumbFront, thumbBack) {
   const brand = r.brand && r.brand !== "unknown" ? r.brand : "";
   const meta = [brand, r.pattern_color].filter(Boolean).join(" · ");
   const gradeChip = v.grade === "D" ? "✗" : v.grade;
+  const gradeLabel = v.grade === "D" ? "Below grade C" : ("Grade " + v.grade);
   const verdictLabel = (v.action === "keep" ? "KEEP" : "DISCARD") + (v.isHigh ? " · ⭐" : "");
   el.innerHTML =
     `<div class="thumbs"><img src="${thumbFront}" alt=""><img src="${thumbBack}" alt=""></div>` +
@@ -494,6 +497,8 @@ function addToHistory(r, thumbFront, thumbBack) {
       `<div class="t">${escapeHtml(r.category || "item")}</div>` +
       `<div class="s">${escapeHtml(meta)}</div>` +
       `<div class="verdict ${v.action}"><span class="grade">${gradeChip}</span> ${verdictLabel}</div>` +
+      (r.grade_reason ? `<div class="reason">${escapeHtml(gradeLabel)} — ${escapeHtml(r.grade_reason)}</div>` : "") +
+      (v.isHigh ? `<div class="value">⭐ ${escapeHtml(r.value_reasoning || "High resale value")}</div>` : "") +
     `</div>`;
   histList.insertBefore(el, histList.firstChild);
 }
