@@ -1,0 +1,395 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleek Sort — Live</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#000; color:#fff; font-family:-apple-system,system-ui,sans-serif; overflow:hidden; }
+  #video { width:100%; height:100vh; object-fit:cover; display:block; }
+  #overlay { position:fixed; inset:0; pointer-events:none; }
+  #status { position:fixed; top:60px; left:12px; right:12px; padding:8px 14px; border-radius:20px;
+            background:rgba(0,0,0,0.55); font-size:14px; text-align:center; transition:background .2s; }
+  #status.settling { background:rgba(234,179,8,0.75); }
+  #status.calling { background:rgba(59,130,246,0.75); }
+  #card { position:fixed; left:12px; right:12px; bottom:16px; background:rgba(20,20,20,0.92);
+          border-radius:16px; padding:16px; transform:translateY(140%); transition:transform .3s ease; z-index:6; }
+  #card.show { transform:translateY(0); }
+  #card.high { background:rgba(180,40,40,0.95); }
+  #card h2 { margin:0 0 6px; font-size:20px; }
+  #card .row { font-size:14px; opacity:0.85; margin:2px 0; }
+  #card .value { font-weight:700; font-size:15px; margin-top:8px; }
+  #flash { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; }
+  #flash.go { animation: flashAnim 0.25s ease; }
+  @keyframes flashAnim { 0%{opacity:0.9;} 100%{opacity:0;} }
+  #setup { position:fixed; inset:0; background:#111; display:flex; flex-direction:column;
+           justify-content:center; align-items:center; padding:24px; z-index:10; }
+  #setup h1 { font-size:22px; margin-bottom:16px; }
+  #setup input { width:100%; max-width:360px; padding:14px; font-size:16px; border-radius:10px;
+                 border:none; margin-bottom:14px; }
+  #setup button { width:100%; max-width:360px; padding:14px; font-size:16px; border-radius:10px;
+                  border:none; background:#3b82f6; color:#fff; font-weight:600; }
+  #setup.hidden { display:none; }
+  #pauseBtn { position:fixed; top:12px; left:12px;
+              padding:10px 18px; font-size:15px; font-weight:600; border:none; border-radius:22px;
+              background:rgba(255,255,255,0.92); color:#111; z-index:5; display:none; }
+  #pauseBtn.show { display:block; }
+  #pauseBtn.paused { background:rgba(59,130,246,0.95); color:#fff; }
+  #badge { position:fixed; top:12px; right:12px; padding:10px 16px; font-size:15px; font-weight:600;
+           border:none; border-radius:22px; background:rgba(0,0,0,0.6); color:#fff; z-index:5; display:none; }
+  #badge.show { display:block; }
+  #badge .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#22c55e; margin-right:6px; }
+  #history { position:fixed; inset:0; background:#0d0d0d; z-index:20; transform:translateY(100%);
+             transition:transform .3s ease; display:flex; flex-direction:column; }
+  #history.show { transform:translateY(0); }
+  #history header { display:flex; align-items:center; justify-content:space-between;
+                    padding:16px; border-bottom:1px solid rgba(255,255,255,0.1); }
+  #history header h2 { margin:0; font-size:18px; }
+  #history header button { background:none; border:none; color:#fff; font-size:26px; line-height:1; }
+  #histList { flex:1; overflow-y:auto; padding:8px 12px 24px; }
+  #histList .empty { opacity:0.5; text-align:center; margin-top:40px; }
+  .hItem { display:flex; gap:12px; padding:10px; margin-bottom:8px; border-radius:12px;
+           background:rgba(255,255,255,0.06); align-items:center; }
+  .hItem.high { background:rgba(180,40,40,0.35); }
+  .hItem img { width:56px; height:56px; object-fit:cover; border-radius:8px; flex:none; }
+  .hItem .info { flex:1; min-width:0; }
+  .hItem .info .t { font-weight:600; font-size:15px; }
+  .hItem .info .s { font-size:13px; opacity:0.8; margin-top:2px; }
+  .hItem .tag { font-size:12px; font-weight:700; color:#fca5a5; margin-top:3px; }
+</style>
+</head>
+<body>
+  <div id="setup">
+    <h1>🔑 Fleek Sort</h1>
+    <input id="apiKeyInput" type="password" placeholder="Paste OpenRouter API key" autocomplete="off">
+    <button id="startBtn">Start camera</button>
+  </div>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="capCanvas" style="display:none"></canvas>
+  <canvas id="diffCanvas" width="80" height="60" style="display:none"></canvas>
+  <div id="flash"></div>
+  <div id="status">starting camera…</div>
+  <button id="pauseBtn">⏸ Pause</button>
+  <button id="badge"><span class="dot"></span><span id="badgeCount">0</span> items</button>
+  <div id="history">
+    <header>
+      <h2>Scanned items</h2>
+      <button id="histClose">×</button>
+    </header>
+    <div id="histList"><div class="empty">No items scanned yet.</div></div>
+  </div>
+  <div id="card">
+    <h2 id="cCategory"></h2>
+    <div class="row" id="cPattern"></div>
+    <div class="row" id="cCondition"></div>
+    <div class="row" id="cBrand"></div>
+    <div class="row value" id="cValue"></div>
+  </div>
+
+<script>
+const video = document.getElementById('video');
+const capCanvas = document.getElementById('capCanvas');
+const diffCanvas = document.getElementById('diffCanvas');
+const diffCtx = diffCanvas.getContext('2d', { willReadFrequently: true });
+const statusEl = document.getElementById('status');
+const card = document.getElementById('card');
+const flashEl = document.getElementById('flash');
+
+const MOTION_THRESH = 12;      // avg per-pixel diff below this = "still"
+const STABLE_NEEDED = 5;       // consecutive still checks before firing
+const COOLDOWN_MS = 2500;
+const CHECK_INTERVAL_MS = 150;
+const PRESENCE_THRESH = 16;    // still frame this far from the empty table = an item is present
+const DUP_THRESH = 14;          // still frame this close to last capture = same item, skip
+
+let prevFrame = null;
+let emptyBaseline = null;       // learned image of the empty table; the "nothing here" reference
+let lastCapturedFrame = null;   // small frame of the last analyzed item (for dedup)
+let stableCount = 0;
+let cooling = false;
+let processing = false;
+let paused = false;
+let armed = true;               // false after a capture until the table is cleared again
+let apiKey = "";
+const history = [];
+
+const badge = document.getElementById('badge');
+const badgeCount = document.getElementById('badgeCount');
+const historyEl = document.getElementById('history');
+const histList = document.getElementById('histList');
+badge.addEventListener('click', () => historyEl.classList.add('show'));
+document.getElementById('histClose').addEventListener('click', () => historyEl.classList.remove('show'));
+
+// avg per-pixel (red channel) difference between two 80x60 frames
+function frameDiff(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i += 4) sum += Math.abs(a[i] - b[i]);
+  return sum / (a.length / 4);
+}
+
+const pauseBtn = document.getElementById('pauseBtn');
+pauseBtn.addEventListener('click', () => {
+  paused = !paused;
+  stableCount = 0;
+  if (paused) {
+    pauseBtn.textContent = "▶ Resume";
+    pauseBtn.classList.add('paused');
+    statusEl.textContent = "⏸ paused";
+    statusEl.className = "";
+  } else {
+    pauseBtn.textContent = "⏸ Pause";
+    pauseBtn.classList.remove('paused');
+    statusEl.textContent = armed ? "watching for an item…" : "✓ scanned — remove item for next";
+    statusEl.className = "";
+  }
+});
+
+const setupEl = document.getElementById('setup');
+const apiKeyInput = document.getElementById('apiKeyInput');
+const startBtn = document.getElementById('startBtn');
+
+const savedKey = localStorage.getItem('openrouter_key');
+if (savedKey) apiKeyInput.value = savedKey;
+
+startBtn.addEventListener('click', () => {
+  apiKey = apiKeyInput.value.trim();
+  if (!apiKey) { alert('Paste your OpenRouter API key first'); return; }
+  localStorage.setItem('openrouter_key', apiKey);
+  setupEl.classList.add('hidden');
+  initCamera().catch(e => { statusEl.textContent = "camera error: " + e.message; });
+});
+
+async function initCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  statusEl.textContent = "point at the empty table…";
+  pauseBtn.classList.add('show');
+  badge.classList.add('show');
+  requestAnimationFrame(loop);
+  setInterval(checkMotion, CHECK_INTERVAL_MS);
+}
+
+function beep(highValue) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.connect(gain); gain.connect(ctx.destination);
+  osc.frequency.value = highValue ? 1046.5 : 660;
+  gain.gain.setValueAtTime(0.3, ctx.currentTime);
+  osc.start();
+  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + (highValue ? 0.6 : 0.15));
+  osc.stop(ctx.currentTime + (highValue ? 0.65 : 0.2));
+}
+
+function doubleBeepHigh() {
+  beep(true);
+  setTimeout(() => beep(true), 350);
+}
+
+function checkMotion() {
+  if (paused || cooling || processing || video.readyState < 2) return;
+
+  diffCtx.drawImage(video, 0, 0, 80, 60);
+  const frame = diffCtx.getImageData(0, 0, 80, 60).data;
+
+  if (prevFrame) {
+    const still = frameDiff(frame, prevFrame) < MOTION_THRESH;
+
+    // Phase 1: learn what the empty table looks like before watching for items.
+    if (!emptyBaseline) {
+      if (still) {
+        stableCount++;
+        statusEl.textContent = `learning empty table… ${stableCount}/${STABLE_NEEDED}`;
+        statusEl.className = "settling";
+        if (stableCount >= STABLE_NEEDED) {
+          emptyBaseline = frame;
+          stableCount = 0;
+          statusEl.textContent = "ready — place an item";
+          statusEl.className = "";
+        }
+      } else {
+        stableCount = 0;
+        statusEl.textContent = "point at the empty table…";
+        statusEl.className = "";
+      }
+      prevFrame = frame;
+      return;
+    }
+
+    // Is something on the table? = how different this still frame is from empty.
+    const tableEmpty = frameDiff(frame, emptyBaseline) < PRESENCE_THRESH;
+
+    if (!armed) {
+      // Locked after a scan — wait until the item is removed (table back to empty).
+      if (still && tableEmpty) {
+        armed = true;
+        stableCount = 0;
+        emptyBaseline = frame;               // refresh baseline to current lighting
+        statusEl.textContent = "watching for an item…";
+        statusEl.className = "";
+      } else {
+        statusEl.textContent = "✓ scanned — remove item for next";
+        statusEl.className = "";
+      }
+      prevFrame = frame;
+      return;
+    }
+
+    if (!still) {
+      stableCount = 0;
+      statusEl.textContent = "watching for an item…";
+      statusEl.className = "";
+    } else if (tableEmpty) {
+      // Still, but nothing there — never fire on an empty table; keep baseline fresh.
+      stableCount = 0;
+      emptyBaseline = frame;
+      statusEl.textContent = "watching for an item…";
+      statusEl.className = "";
+    } else {
+      // Still AND an item is present — settle, then scan.
+      stableCount++;
+      statusEl.textContent = `holding still… ${stableCount}/${STABLE_NEEDED}`;
+      statusEl.className = "settling";
+      if (stableCount >= STABLE_NEEDED) {
+        stableCount = 0;
+        // Similarity backstop: if it looks like the item we just logged, skip it.
+        if (lastCapturedFrame && frameDiff(frame, lastCapturedFrame) < DUP_THRESH) {
+          armed = false;
+          statusEl.textContent = "✓ same item — remove for next";
+          statusEl.className = "";
+        } else {
+          captureAndAnalyze(frame);
+        }
+      }
+    }
+  }
+  prevFrame = frame;
+}
+
+function loop() { requestAnimationFrame(loop); }
+
+async function captureAndAnalyze(smallFrame) {
+  processing = true;
+  cooling = true;
+  statusEl.textContent = "📸 analyzing…";
+  statusEl.className = "calling";
+  flashEl.classList.add('go');
+  setTimeout(() => flashEl.classList.remove('go'), 300);
+
+  capCanvas.width = video.videoWidth;
+  capCanvas.height = video.videoHeight;
+  const ctx = capCanvas.getContext('2d');
+  ctx.drawImage(video, 0, 0);
+  const dataUrl = capCanvas.toDataURL('image/jpeg', 0.7);
+  const thumb = makeThumb();
+
+  try {
+    const result = await callGemini(dataUrl);
+    // Lock onto this item so it won't be re-scanned until the table changes.
+    armed = false;
+    lastCapturedFrame = smallFrame;
+    addToHistory(result, thumb);
+    showCard(result);
+  } catch (e) {
+    // Leave it armed so a retry can happen without removing the item.
+    statusEl.textContent = "error: " + e.message;
+  }
+
+  processing = false;
+  setTimeout(() => {
+    cooling = false;
+    if (armed) { statusEl.textContent = "watching for an item…"; statusEl.className = ""; }
+  }, COOLDOWN_MS);
+}
+
+// A small JPEG thumbnail of the current capture, for the history list.
+function makeThumb() {
+  const w = 140, h = Math.round(w * capCanvas.height / capCanvas.width);
+  const t = document.createElement('canvas');
+  t.width = w; t.height = h;
+  t.getContext('2d').drawImage(capCanvas, 0, 0, w, h);
+  return t.toDataURL('image/jpeg', 0.6);
+}
+
+function addToHistory(r, thumb) {
+  const isHigh = r.resale_value_signal === "high";
+  history.unshift({ r, thumb, isHigh });
+  badgeCount.textContent = history.length;
+
+  if (history.length === 1) histList.innerHTML = "";
+  const el = document.createElement('div');
+  el.className = "hItem" + (isHigh ? " high" : "");
+  const brand = r.brand && r.brand !== "unknown" ? r.brand : "";
+  const meta = [brand, r.condition, r.pattern_color].filter(Boolean).join(" · ");
+  el.innerHTML =
+    `<img src="${thumb}" alt="">` +
+    `<div class="info"><div class="t">${escapeHtml(r.category || "item")}</div>` +
+    `<div class="s">${escapeHtml(meta)}</div>` +
+    (isHigh ? `<div class="tag">⭐ HIGH VALUE — ${escapeHtml(r.value_reasoning || "")}</div>` : "") +
+    `</div>`;
+  histList.insertBefore(el, histList.firstChild);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+}
+
+const PROMPT = `You are looking at a single frame from a live camera feed above a charity donation intake table. A garment has just been placed down. Identify:
+- category
+- condition: one of "new", "like new", "good", "fair", "poor"
+- brand: only if a visible logo/tag is present, else "unknown"
+- brand_evidence: what you saw, or "none"
+- pattern_color: short description
+- resale_value_signal: "high", "medium", or "low" — "high" means this item shows signs a typical volunteer sorter would miss but a vintage/resale buyer would value: recognizable designer/premium brand, vintage construction, band/graphic tees, deadstock/new-with-tags condition, rare colorways, notable sports/collectible merchandise. Most ordinary donated clothing is "low".
+- value_reasoning: one short sentence, or "none"
+
+Return ONLY JSON, no markdown fences:
+{"category":"...", "condition":"...", "brand":"...", "brand_evidence":"...", "pattern_color":"...", "resale_value_signal":"...", "value_reasoning":"..."}`;
+
+async function callGemini(dataUrl) {
+  const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + apiKey,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "google/gemini-3.5-flash",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: PROMPT },
+          { type: "image_url", image_url: { url: dataUrl } }
+        ]
+      }]
+    })
+  });
+  const body = await resp.json();
+  if (body.error) throw new Error(body.error.message || JSON.stringify(body.error));
+  const content = body.choices[0].message.content;
+  const match = content.match(/\{[\s\S]*\}/);
+  return JSON.parse(match[0]);
+}
+
+function showCard(r) {
+  document.getElementById('cCategory').textContent = r.category || "item";
+  document.getElementById('cPattern').textContent = r.pattern_color || "";
+  document.getElementById('cCondition').textContent = "Condition: " + (r.condition || "?");
+  document.getElementById('cBrand').textContent = "Brand: " + (r.brand || "unknown");
+  const isHigh = r.resale_value_signal === "high";
+  const valueEl = document.getElementById('cValue');
+  valueEl.textContent = isHigh ? ("⭐ HIGH VALUE — " + r.value_reasoning) : "";
+  card.className = isHigh ? "show high" : "show";
+  beep(false);
+  if (isHigh) doubleBeepHigh();
+
+  setTimeout(() => card.classList.remove('show'), 4000);
+}
+</script>
+</body>
+</html>
