@@ -486,8 +486,7 @@ function addToHistory(r, thumbFront, thumbBack) {
   if (history.length === 1) histList.innerHTML = "";
   const el = document.createElement('div');
   el.className = "hItem " + v.action;
-  const brand = r.brand && r.brand !== "unknown" ? r.brand : "";
-  const meta = [brand, r.pattern_color].filter(Boolean).join(" · ");
+  const meta = ["Brand: " + (r.brand || "unknown"), r.pattern_color].filter(Boolean).join(" · ");
   const gradeChip = v.grade === "D" ? "✗" : v.grade;
   const gradeLabel = v.grade === "D" ? "Below grade C" : ("Grade " + v.grade);
   const verdictLabel = (v.action === "keep" ? "KEEP" : "DISCARD") + (v.isHigh ? " · ⭐" : "");
