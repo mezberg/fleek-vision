@@ -40,6 +40,18 @@
            border:none; border-radius:22px; background:rgba(0,0,0,0.6); color:#fff; z-index:5; display:none; }
   #badge.show { display:block; }
   #badge .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#22c55e; margin-right:6px; }
+  #recalibBtn { position:fixed; top:12px; left:50%; transform:translateX(-50%);
+                padding:10px 16px; font-size:14px; font-weight:600; border:none; border-radius:22px;
+                background:rgba(0,0,0,0.6); color:#fff; z-index:5; display:none; }
+  #recalibBtn.show { display:block; }
+  #calib { position:fixed; inset:0; z-index:15; display:none; flex-direction:column;
+           justify-content:center; align-items:center; padding:0 20px; pointer-events:none; }
+  #calib.show { display:flex; }
+  #calib .box { background:rgba(0,0,0,0.82); border-radius:16px; padding:22px; max-width:360px;
+                width:100%; text-align:center; pointer-events:auto; }
+  #calib .box p { margin:0 0 16px; font-size:15px; line-height:1.45; }
+  #calib .box button { width:100%; padding:14px; font-size:16px; font-weight:700; border:none;
+                       border-radius:10px; background:#22c55e; color:#04310f; }
   #history { position:fixed; inset:0; background:#0d0d0d; z-index:20; transform:translateY(100%);
              transition:transform .3s ease; display:flex; flex-direction:column; }
   #history.show { transform:translateY(0); }
@@ -71,7 +83,14 @@
   <div id="flash"></div>
   <div id="status">starting camera…</div>
   <button id="pauseBtn">⏸ Pause</button>
+  <button id="recalibBtn">⟲ Set empty table</button>
   <button id="badge"><span class="dot"></span><span id="badgeCount">0</span> items</button>
+  <div id="calib">
+    <div class="box">
+      <p>📸 Point the camera at the <b>empty table</b>, then tap below to save it as the baseline.</p>
+      <button id="setBaselineBtn">Set baseline</button>
+    </div>
+  </div>
   <div id="history">
     <header>
       <h2>Scanned items</h2>
@@ -128,6 +147,38 @@ function frameDiff(a, b) {
   return sum / (a.length / 4);
 }
 
+// grab the current camera frame as an 80x60 sample
+function grabFrame() {
+  diffCtx.drawImage(video, 0, 0, 80, 60);
+  return diffCtx.getImageData(0, 0, 80, 60).data;
+}
+
+const calibEl = document.getElementById('calib');
+const recalibBtn = document.getElementById('recalibBtn');
+
+// Open the explicit "point at the empty table" prompt; detection is suspended until set.
+function startCalibration() {
+  emptyBaseline = null;
+  armed = true;
+  stableCount = 0;
+  calibEl.classList.add('show');
+  statusEl.textContent = "calibrating — aim at the empty table";
+  statusEl.className = "";
+}
+
+document.getElementById('setBaselineBtn').addEventListener('click', () => {
+  if (video.readyState < 2) return;
+  emptyBaseline = grabFrame();
+  lastCapturedFrame = null;
+  armed = true;
+  stableCount = 0;
+  calibEl.classList.remove('show');
+  statusEl.textContent = "✓ baseline set — place an item";
+  statusEl.className = "";
+});
+
+recalibBtn.addEventListener('click', startCalibration);
+
 const pauseBtn = document.getElementById('pauseBtn');
 pauseBtn.addEventListener('click', () => {
   paused = !paused;
@@ -167,9 +218,10 @@ async function initCamera() {
   });
   video.srcObject = stream;
   await video.play();
-  statusEl.textContent = "point at the empty table…";
   pauseBtn.classList.add('show');
   badge.classList.add('show');
+  recalibBtn.classList.add('show');
+  startCalibration();
   requestAnimationFrame(loop);
   setInterval(checkMotion, CHECK_INTERVAL_MS);
 }
@@ -200,23 +252,8 @@ function checkMotion() {
   if (prevFrame) {
     const still = frameDiff(frame, prevFrame) < MOTION_THRESH;
 
-    // Phase 1: learn what the empty table looks like before watching for items.
+    // No baseline yet — the explicit calibration prompt (#calib) is showing. Do nothing.
     if (!emptyBaseline) {
-      if (still) {
-        stableCount++;
-        statusEl.textContent = `learning empty table… ${stableCount}/${STABLE_NEEDED}`;
-        statusEl.className = "settling";
-        if (stableCount >= STABLE_NEEDED) {
-          emptyBaseline = frame;
-          stableCount = 0;
-          statusEl.textContent = "ready — place an item";
-          statusEl.className = "";
-        }
-      } else {
-        stableCount = 0;
-        statusEl.textContent = "point at the empty table…";
-        statusEl.className = "";
-      }
       prevFrame = frame;
       return;
     }
@@ -225,11 +262,12 @@ function checkMotion() {
     const tableEmpty = frameDiff(frame, emptyBaseline) < PRESENCE_THRESH;
 
     if (!armed) {
-      // Locked after a scan — wait until the item is removed (table back to empty).
-      if (still && tableEmpty) {
+      // Locked after a scan. Re-arm when the item LEAVES (frame diverges from what we
+      // just captured) — a relative check, so camera auto-exposure drift can't wedge it.
+      if (still && lastCapturedFrame && frameDiff(frame, lastCapturedFrame) >= PRESENCE_THRESH) {
         armed = true;
         stableCount = 0;
-        emptyBaseline = frame;               // refresh baseline to current lighting
+        emptyBaseline = frame;               // item's gone — re-anchor "empty" to right now
         statusEl.textContent = "watching for an item…";
         statusEl.className = "";
       } else {
