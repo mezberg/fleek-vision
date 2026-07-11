@@ -81,6 +81,9 @@
   .hItem .verdict.discard { color:#f87171; }
   .hItem .verdict .grade { display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px;
                            padding:0 5px; border-radius:6px; background:rgba(255,255,255,0.15); color:#fff; font-size:13px; }
+  #cvOverlay { position:fixed; inset:0; width:100%; height:100vh; pointer-events:none; z-index:7; }
+  #cvbadge { position:fixed; top:96px; left:50%; transform:translateX(-50%); z-index:5;
+             font-size:11px; padding:4px 10px; border-radius:12px; background:rgba(0,0,0,0.5); opacity:0.8; }
 </style>
 </head>
 <body>
@@ -93,9 +96,12 @@
   <video id="video" autoplay playsinline muted></video>
   <canvas id="capCanvas" style="display:none"></canvas>
   <canvas id="diffCanvas" width="80" height="60" style="display:none"></canvas>
+  <canvas id="cvCanvas" width="160" height="120" style="display:none"></canvas>
+  <canvas id="cvOverlay"></canvas>
   <div id="flash"></div>
   <div id="edge"></div>
   <div id="status">starting camera…</div>
+  <div id="cvbadge">OpenCV: loading…</div>
   <button id="pauseBtn">⏸ Pause</button>
   <button id="recalibBtn">⟲ Set empty table</button>
   <button id="badge"><span class="dot"></span><span id="badgeCount">0</span> items</button>
@@ -189,12 +195,129 @@ function grabFrame() {
   return diffCtx.getImageData(0, 0, 80, 60).data;
 }
 
+// ===== OpenCV.js detection (EXPERIMENT) ============================================
+// Instead of a whole-frame average, use absdiff-vs-empty-baseline + threshold +
+// morphology + contours to find the largest item-sized blob and its bounding box.
+// Area gating means small background motion (a distant person) is ignored, and the
+// bbox lets us crop tightly to the garment before sending to the model.
+const CVW = 160, CVH = 120;                 // detection resolution
+const CV_MIN_AREA_FRAC = 0.04;              // blob must cover >= 4% of the frame to be an "item"
+const CV_MOTION_MEAN = 6;                   // mean gray change below this = still
+const CV_DIFF_THRESH = 28;                  // per-pixel gray diff considered "changed"
+const cvCanvas = document.getElementById('cvCanvas');
+const cvCtx = cvCanvas.getContext('2d', { willReadFrequently: true });
+const cvOverlay = document.getElementById('cvOverlay');
+const cvOverlayCtx = cvOverlay.getContext('2d');
+const cvbadge = document.getElementById('cvbadge');
+cvOverlay.width = CVW; cvOverlay.height = CVH;   // internal res; CSS stretches to screen
+
+let cvReady = false;
+let cvBaseline = null;     // cv.Mat: grayscale+blurred empty-table reference
+let cvPrevGray = null;     // cv.Mat: previous grayscale frame (for stillness)
+let lastBBox = null;       // {x,y,w,h} in CVW×CVH space, or null
+
+function onOpenCvLoaded() {
+  // opencv.js exposes cv in a few shapes depending on build — handle them all.
+  if (typeof cv === 'undefined') { cvbadge.textContent = "OpenCV: failed to load"; return; }
+  if (cv instanceof Promise) { cv.then(m => { window.cv = m; cvOnReady(); }); }
+  else if (cv.Mat) { cvOnReady(); }
+  else { cv['onRuntimeInitialized'] = cvOnReady; }
+}
+function cvOnReady() { cvReady = true; cvbadge.textContent = "OpenCV: ready"; }
+
+function cvGrayscaleOfVideo() {
+  cvCtx.drawImage(video, 0, 0, CVW, CVH);
+  const src = cv.imread(cvCanvas);
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+  src.delete();
+  return gray;
+}
+
+// Capture the current view as the "empty table" reference.
+function cvSetBaseline() {
+  if (!cvReady || video.readyState < 2) return;
+  if (cvBaseline) cvBaseline.delete();
+  cvBaseline = cvGrayscaleOfVideo();
+}
+
+// Returns { present, still, bbox } for this frame (or null if OpenCV isn't ready yet).
+function cvDetect() {
+  if (!cvReady || video.readyState < 2) return null;
+  const gray = cvGrayscaleOfVideo();
+
+  let still = true;
+  if (cvPrevGray) {
+    const d = new cv.Mat();
+    cv.absdiff(gray, cvPrevGray, d);
+    still = cv.mean(d)[0] < CV_MOTION_MEAN;
+    d.delete();
+    cvPrevGray.delete();
+  }
+  cvPrevGray = gray.clone();
+
+  let present = false, bbox = null;
+  if (cvBaseline) {
+    const diff = new cv.Mat();
+    cv.absdiff(gray, cvBaseline, diff);
+    cv.threshold(diff, diff, CV_DIFF_THRESH, 255, cv.THRESH_BINARY);
+    const k = cv.Mat.ones(5, 5, cv.CV_8U);
+    cv.morphologyEx(diff, diff, cv.MORPH_OPEN, k);
+    cv.morphologyEx(diff, diff, cv.MORPH_CLOSE, k);
+    const contours = new cv.MatVector();
+    const hier = new cv.Mat();
+    cv.findContours(diff, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    let best = 0, bi = -1;
+    for (let i = 0; i < contours.size(); i++) {
+      const a = cv.contourArea(contours.get(i));
+      if (a > best) { best = a; bi = i; }
+    }
+    if (bi >= 0 && best > CV_MIN_AREA_FRAC * CVW * CVH) {
+      const r = cv.boundingRect(contours.get(bi));
+      present = true;
+      bbox = { x: r.x, y: r.y, w: r.width, h: r.height };
+    }
+    diff.delete(); k.delete(); contours.delete(); hier.delete();
+  }
+  gray.delete();
+  return { present, still, bbox };
+}
+
+// Draw the detected box on the overlay so we can see what OpenCV is locking onto.
+function drawOverlay(bbox, colorState) {
+  cvOverlayCtx.clearRect(0, 0, CVW, CVH);
+  if (!bbox) return;
+  cvOverlayCtx.lineWidth = 2;
+  cvOverlayCtx.strokeStyle = colorState === 'settling' ? '#eab308'
+                           : colorState === 'ready' ? '#22c55e' : '#3b82f6';
+  cvOverlayCtx.strokeRect(bbox.x, bbox.y, bbox.w, bbox.h);
+}
+
+// Capture a full-res JPEG cropped to the detected item (with padding), for the model.
+function captureCropped(bbox) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  let sx = 0, sy = 0, sw = vw, sh = vh;
+  if (bbox) {
+    const kx = vw / CVW, ky = vh / CVH, pad = 0.15;
+    sx = bbox.x * kx; sy = bbox.y * ky; sw = bbox.w * kx; sh = bbox.h * ky;
+    sx = Math.max(0, sx - sw * pad); sy = Math.max(0, sy - sh * pad);
+    sw = Math.min(vw - sx, sw * (1 + 2 * pad)); sh = Math.min(vh - sy, sh * (1 + 2 * pad));
+  }
+  capCanvas.width = Math.round(sw); capCanvas.height = Math.round(sh);
+  capCanvas.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, capCanvas.width, capCanvas.height);
+  return { dataUrl: capCanvas.toDataURL('image/jpeg', 0.8), thumb: makeThumb() };
+}
+// ===================================================================================
+
 const calibEl = document.getElementById('calib');
 const recalibBtn = document.getElementById('recalibBtn');
 
 // Open the explicit "point at the empty table" prompt; detection is suspended until set.
 function startCalibration() {
   emptyBaseline = null;
+  if (cvBaseline) { cvBaseline.delete(); cvBaseline = null; }
+  lastBBox = null;
   armed = true;
   stableCount = 0;
   stage = 'IDLE';
@@ -207,8 +330,10 @@ function startCalibration() {
 
 document.getElementById('setBaselineBtn').addEventListener('click', () => {
   if (video.readyState < 2) return;
-  emptyBaseline = grabFrame();
+  if (!cvReady) { statusEl.textContent = "OpenCV still loading — try again in a moment"; return; }
+  cvSetBaseline();
   lastCapturedFrame = null;
+  lastBBox = null;
   armed = true;
   stableCount = 0;
   stage = 'IDLE';
@@ -305,118 +430,85 @@ function checkMotion() {
   // call — we only avoid starting a second call (handled at the capture step below).
   if (paused || video.readyState < 2) return;
 
-  diffCtx.drawImage(video, 0, 0, 80, 60);
-  const frame = diffCtx.getImageData(0, 0, 80, 60).data;
+  const det = cvDetect();
+  if (!det) return;                       // OpenCV not ready yet
+  const { present, still, bbox } = det;
+  lastBBox = bbox;
 
-  if (prevFrame) {
-    const still = frameDiff(frame, prevFrame) < MOTION_THRESH;
+  // No baseline yet — the explicit calibration prompt (#calib) is showing.
+  if (!cvBaseline) { drawOverlay(null); return; }
 
-    // No baseline yet — the explicit calibration prompt (#calib) is showing. Do nothing.
-    if (!emptyBaseline) {
-      prevFrame = frame;
-      return;
-    }
+  const overlayState = stage === 'AWAIT_FLIP' ? 'settling'
+                     : (armed && present && still) ? 'settling' : 'ready';
+  drawOverlay(present ? bbox : null, overlayState);
 
-    // Is something on the table? = how different this still frame is from empty.
-    const tableEmpty = frameDiff(frame, emptyBaseline) < PRESENCE_THRESH;
-
-    if (!armed) {
-      // Locked after a scan. Re-arm when the item LEAVES (frame diverges from what we
-      // just captured) — a relative check, so camera auto-exposure drift can't wedge it.
-      if (still && lastCapturedFrame && frameDiff(frame, lastCapturedFrame) >= PRESENCE_THRESH) {
-        // The scene changed from what we scanned (item removed OR swapped for another).
-        // Just re-arm — do NOT touch emptyBaseline here, or a swapped-in item would be
-        // mistaken for the empty background and could never be detected.
-        armed = true;
-        stableCount = 0;
-        statusEl.textContent = "watching for an item…";
-        statusEl.className = "";
-      } else {
-        statusEl.textContent = "✓ scanned — remove item for next";
-        statusEl.className = "";
-      }
-      prevFrame = frame;
-      return;
-    }
-
-    if (stage === 'AWAIT_FLIP') {
-      if (tableEmpty) {
-        // Item removed instead of flipped — abandon side 1 and go back to watching.
-        stage = 'IDLE';
-        side1Capture = null;
-        flipMotionSeen = false;
-        stableCount = 0;
-        emptyBaseline = frame;
-        statusEl.textContent = "watching for an item…";
-        statusEl.className = "";
-      } else if (!still) {
-        // Motion while an item is still present — this is the flip happening.
-        flipMotionSeen = true;
-        stableCount = 0;
-        statusEl.textContent = "flip in progress…";
-        statusEl.className = "settling";
-      } else if (!flipMotionSeen) {
-        // Still, but nothing has moved since side 1 yet — keep prompting.
-        statusEl.textContent = "✓ side 1 captured — 🔄 now flip the item";
-        statusEl.className = "settling";
-      } else {
-        stableCount++;
-        statusEl.textContent = `other side holding still… ${stableCount}/${STABLE_NEEDED}`;
-        statusEl.className = "settling";
-        if (stableCount >= STABLE_NEEDED) {
-          stableCount = 0;
-          captureSide2AndAnalyze(frame);
-        }
-      }
-      prevFrame = frame;
-      return;
-    }
-
-    if (!still) {
+  if (!armed) {
+    // Locked after a scan. Re-arm when the item LEAVES (blob gone = table clear).
+    // Presence is measured against the empty baseline, so a swapped-in item stays
+    // "present" and won't wedge the state the way frame-similarity could.
+    if (!present) {
+      armed = true;
       stableCount = 0;
-      statusEl.textContent = "watching for an item…";
-      statusEl.className = "";
-    } else if (tableEmpty) {
-      // Still, but nothing there — never fire on an empty table; keep baseline fresh.
-      stableCount = 0;
-      emptyBaseline = frame;
       statusEl.textContent = "watching for an item…";
       statusEl.className = "";
     } else {
-      // Still AND an item is present — settle, then scan.
+      statusEl.textContent = "✓ scanned — remove item for next";
+      statusEl.className = "";
+    }
+    return;
+  }
+
+  if (stage === 'AWAIT_FLIP') {
+    if (!present) {
+      // Item removed instead of flipped — abandon side 1 and go back to watching.
+      stage = 'IDLE'; side1Capture = null; flipMotionSeen = false; stableCount = 0;
+      statusEl.textContent = "watching for an item…"; statusEl.className = "";
+    } else if (!still) {
+      // Motion while an item is still present — this is the flip happening.
+      flipMotionSeen = true; stableCount = 0;
+      statusEl.textContent = "flip in progress…"; statusEl.className = "settling";
+    } else if (!flipMotionSeen) {
+      statusEl.textContent = "✓ side 1 captured — 🔄 now flip the item"; statusEl.className = "settling";
+    } else {
       stableCount++;
-      statusEl.textContent = `holding still… ${stableCount}/${STABLE_NEEDED}`;
+      statusEl.textContent = `other side holding still… ${stableCount}/${STABLE_NEEDED}`;
       statusEl.className = "settling";
-      if (stableCount >= STABLE_NEEDED) {
-        // Similarity backstop: if it looks like the item we just logged, skip it.
-        if (lastCapturedFrame && frameDiff(frame, lastCapturedFrame) < DUP_THRESH) {
-          stableCount = 0;
-          armed = false;
-          statusEl.textContent = "✓ same item — remove for next";
-          statusEl.className = "";
-        } else if (processing) {
-          // A previous analysis is still running — keep watching, don't call Gemini again yet.
-          statusEl.textContent = "⏳ analyzing previous…";
-          statusEl.className = "calling";
-        } else {
-          stableCount = 0;
-          captureSide1(frame);
-        }
+      if (stableCount >= STABLE_NEEDED) { stableCount = 0; captureSide2AndAnalyze(bbox); }
+    }
+    return;
+  }
+
+  if (!present) {
+    stableCount = 0;
+    statusEl.textContent = "watching for an item…";
+    statusEl.className = "";
+  } else if (!still) {
+    stableCount = 0;
+    statusEl.textContent = "item moving…";
+    statusEl.className = "settling";
+  } else {
+    // Still AND an item-sized blob is present — settle, then scan.
+    stableCount++;
+    statusEl.textContent = `holding still… ${stableCount}/${STABLE_NEEDED}`;
+    statusEl.className = "settling";
+    if (stableCount >= STABLE_NEEDED) {
+      if (processing) {
+        // A previous analysis is still running — keep watching, don't call Gemini again yet.
+        statusEl.textContent = "⏳ analyzing previous…";
+        statusEl.className = "calling";
+      } else {
+        stableCount = 0;
+        captureSide1(bbox);
       }
     }
   }
-  prevFrame = frame;
 }
 
 function loop() { requestAnimationFrame(loop); }
 
-// Side 1: just capture and hold — no Gemini call yet, we need side 2 first.
-function captureSide1(smallFrame) {
-  capCanvas.width = video.videoWidth;
-  capCanvas.height = video.videoHeight;
-  const ctx = capCanvas.getContext('2d');
-  ctx.drawImage(video, 0, 0);
-  side1Capture = { dataUrl: capCanvas.toDataURL('image/jpeg', 0.7), thumb: makeThumb() };
+// Side 1: capture (cropped to the detected item) and hold — no Gemini call yet.
+function captureSide1(bbox) {
+  side1Capture = captureCropped(bbox);
 
   stage = 'AWAIT_FLIP';
   flipMotionSeen = false;
@@ -427,20 +519,15 @@ function captureSide1(smallFrame) {
   statusEl.className = "settling";
 }
 
-// Side 2: capture, then send both photos to Gemini together for one combined decision.
-async function captureSide2AndAnalyze(smallFrame) {
+// Side 2: capture (cropped), then send both photos to Gemini together for one decision.
+async function captureSide2AndAnalyze(bbox) {
   processing = true;
   statusEl.textContent = "📸 analyzing both sides…";
   statusEl.className = "calling";
   flashEl.classList.add('go');
   setTimeout(() => flashEl.classList.remove('go'), 300);
 
-  capCanvas.width = video.videoWidth;
-  capCanvas.height = video.videoHeight;
-  const ctx = capCanvas.getContext('2d');
-  ctx.drawImage(video, 0, 0);
-  const dataUrl2 = capCanvas.toDataURL('image/jpeg', 0.7);
-  const thumb2 = makeThumb();
+  const cap2 = captureCropped(bbox);
   const side1 = side1Capture;
 
   // Reset the flip sequence now — a failed call means starting the sequence over,
@@ -450,11 +537,10 @@ async function captureSide2AndAnalyze(smallFrame) {
   flipMotionSeen = false;
 
   try {
-    const result = await callGemini(side1.dataUrl, dataUrl2);
-    // Lock onto this item so it won't be re-scanned until the table changes.
+    const result = await callGemini(side1.dataUrl, cap2.dataUrl);
+    // Lock onto this item; re-arm happens when the blob leaves (presence-based).
     armed = false;
-    lastCapturedFrame = smallFrame;
-    addToHistory(result, side1.thumb, thumb2);
+    addToHistory(result, side1.thumb, cap2.thumb);
     showCard(result);
   } catch (e) {
     statusEl.textContent = "error: " + e.message;
@@ -567,6 +653,7 @@ function showCard(r) {
   setTimeout(() => card.classList.remove('show'), 4500);
 }
 </script>
+<script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvLoaded()"></script>
 </body>
 </html>
 
