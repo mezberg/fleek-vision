@@ -196,14 +196,19 @@ function grabFrame() {
 }
 
 // ===== OpenCV.js detection (EXPERIMENT) ============================================
-// Instead of a whole-frame average, use absdiff-vs-empty-baseline + threshold +
-// morphology + contours to find the largest item-sized blob and its bounding box.
-// Area gating means small background motion (a distant person) is ignored, and the
-// bbox lets us crop tightly to the garment before sending to the model.
+// Presence via ADAPTIVE background subtraction (MOG2) + Canny edge-density, which is
+// robust to camera auto-exposure / lighting drift (unlike diffing a frozen baseline).
+// We extract the item's real CONTOUR (for the overlay and to mask the crop to the
+// silhouette on a distinctive background before sending to the model).
 const CVW = 160, CVH = 120;                 // detection resolution
 const CV_MIN_AREA_FRAC = 0.04;              // blob must cover >= 4% of the frame to be an "item"
+const CV_MAX_AREA_FRAC = 0.85;              // blob covering ~whole frame = lighting glitch, not an item
 const CV_MOTION_MEAN = 6;                   // mean gray change below this = still
-const CV_DIFF_THRESH = 28;                  // per-pixel gray diff considered "changed"
+const BG_HISTORY = 500, BG_VARTHRESH = 40;  // MOG2 params
+const BG_LEARN = 0.02;                      // background learning rate while idle-watching (absorbs drift)
+const CANNY_LO = 40, CANNY_HI = 120;        // Canny edge thresholds
+const EDGE_MARGIN = 4;                      // item region must exceed empty-table edge density by this
+const MASK_BG = "#7f7f7f";                  // neutral gray behind the masked item — contrasts any color
 const cvCanvas = document.getElementById('cvCanvas');
 const cvCtx = cvCanvas.getContext('2d', { willReadFrequently: true });
 const cvOverlay = document.getElementById('cvOverlay');
@@ -212,9 +217,11 @@ const cvbadge = document.getElementById('cvbadge');
 cvOverlay.width = CVW; cvOverlay.height = CVH;   // internal res; CSS stretches to screen
 
 let cvReady = false;
-let cvBaseline = null;     // cv.Mat: grayscale+blurred empty-table reference
+let cvCalibrated = false;
+let bgSub = null;          // cv.BackgroundSubtractorMOG2 — the adaptive background model
+let baseEdgeDensity = 0;   // mean Canny response of the empty table
 let cvPrevGray = null;     // cv.Mat: previous grayscale frame (for stillness)
-let lastBBox = null;       // {x,y,w,h} in CVW×CVH space, or null
+let lastRegion = null;     // { bbox, contour } of the last detection
 
 function onOpenCvLoaded() {
   // opencv.js exposes cv in a few shapes depending on build — handle them all.
@@ -235,16 +242,27 @@ function cvGrayscaleOfVideo() {
   return gray;
 }
 
-// Capture the current view as the "empty table" reference.
+// (Re)build the adaptive background model from the current (empty) view.
 function cvSetBaseline() {
   if (!cvReady || video.readyState < 2) return;
-  if (cvBaseline) cvBaseline.delete();
-  cvBaseline = cvGrayscaleOfVideo();
+  if (bgSub) { bgSub.delete(); bgSub = null; }
+  bgSub = new cv.BackgroundSubtractorMOG2(BG_HISTORY, BG_VARTHRESH, false);
+  // prime the model with several frames of the empty table (high learning rate)
+  for (let i = 0; i < 10; i++) {
+    const g = cvGrayscaleOfVideo(); const m = new cv.Mat();
+    bgSub.apply(g, m, 0.6); g.delete(); m.delete();
+  }
+  // remember how "edgy" the empty table is, so we can tell a real item apart from a light shift
+  const g = cvGrayscaleOfVideo(); const e = new cv.Mat();
+  cv.Canny(g, e, CANNY_LO, CANNY_HI); baseEdgeDensity = cv.mean(e)[0];
+  g.delete(); e.delete();
+  cvCalibrated = true;
 }
 
-// Returns { present, still, bbox } for this frame (or null if OpenCV isn't ready yet).
+// Returns { present, still, bbox, contour } (contour = array of {x,y} in CVW×CVH space).
 function cvDetect() {
   if (!cvReady || video.readyState < 2) return null;
+  if (!cvCalibrated) return { present: false, still: true, bbox: null, contour: null };
   const gray = cvGrayscaleOfVideo();
 
   let still = true;
@@ -257,56 +275,91 @@ function cvDetect() {
   }
   cvPrevGray = gray.clone();
 
-  let present = false, bbox = null;
-  if (cvBaseline) {
-    const diff = new cv.Mat();
-    cv.absdiff(gray, cvBaseline, diff);
-    cv.threshold(diff, diff, CV_DIFF_THRESH, 255, cv.THRESH_BINARY);
-    const k = cv.Mat.ones(5, 5, cv.CV_8U);
-    cv.morphologyEx(diff, diff, cv.MORPH_OPEN, k);
-    cv.morphologyEx(diff, diff, cv.MORPH_CLOSE, k);
-    const contours = new cv.MatVector();
-    const hier = new cv.Mat();
-    cv.findContours(diff, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    let best = 0, bi = -1;
-    for (let i = 0; i < contours.size(); i++) {
-      const a = cv.contourArea(contours.get(i));
-      if (a > best) { best = a; bi = i; }
-    }
-    if (bi >= 0 && best > CV_MIN_AREA_FRAC * CVW * CVH) {
-      const r = cv.boundingRect(contours.get(bi));
+  // Adaptive background subtraction. Learn (absorb drift) only while idle-watching;
+  // freeze learning once an item is present/locked so it isn't dissolved into the bg.
+  const lr = (armed && stage === 'IDLE') ? BG_LEARN : 0;
+  const fg = new cv.Mat();
+  bgSub.apply(gray, fg, lr);
+  cv.threshold(fg, fg, 200, 255, cv.THRESH_BINARY);   // keep hard foreground only
+  const k = cv.Mat.ones(5, 5, cv.CV_8U);
+  cv.morphologyEx(fg, fg, cv.MORPH_OPEN, k);
+  cv.morphologyEx(fg, fg, cv.MORPH_CLOSE, k);
+
+  let present = false, bbox = null, contour = null;
+  const contours = new cv.MatVector();
+  const hier = new cv.Mat();
+  cv.findContours(fg, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+  let best = 0, bi = -1;
+  for (let i = 0; i < contours.size(); i++) {
+    const a = cv.contourArea(contours.get(i));
+    if (a > best) { best = a; bi = i; }
+  }
+  const frame = CVW * CVH;
+  if (bi >= 0 && best > CV_MIN_AREA_FRAC * frame && best < CV_MAX_AREA_FRAC * frame) {
+    const r = cv.boundingRect(contours.get(bi));
+    // Edge-density confirmation: a real item adds edges; a pure lighting change doesn't.
+    const edges = new cv.Mat();
+    cv.Canny(gray, edges, CANNY_LO, CANNY_HI);
+    const roi = edges.roi(r);
+    const dens = cv.mean(roi)[0];
+    roi.delete(); edges.delete();
+    if (dens > baseEdgeDensity + EDGE_MARGIN) {
       present = true;
       bbox = { x: r.x, y: r.y, w: r.width, h: r.height };
+      const d = contours.get(bi).data32S;         // [x0,y0,x1,y1,...]
+      contour = [];
+      for (let i = 0; i < d.length; i += 2) contour.push({ x: d[i], y: d[i + 1] });
     }
-    diff.delete(); k.delete(); contours.delete(); hier.delete();
   }
-  gray.delete();
-  return { present, still, bbox };
+  contours.delete(); hier.delete(); fg.delete(); k.delete(); gray.delete();
+  return { present, still, bbox, contour };
 }
 
-// Draw the detected box on the overlay so we can see what OpenCV is locking onto.
-function drawOverlay(bbox, colorState) {
+// Draw the item's real outline (contour polygon) on the overlay.
+function drawOverlay(contour, colorState) {
   cvOverlayCtx.clearRect(0, 0, CVW, CVH);
-  if (!bbox) return;
+  if (!contour || contour.length < 3) return;
   cvOverlayCtx.lineWidth = 2;
   cvOverlayCtx.strokeStyle = colorState === 'settling' ? '#eab308'
                            : colorState === 'ready' ? '#22c55e' : '#3b82f6';
-  cvOverlayCtx.strokeRect(bbox.x, bbox.y, bbox.w, bbox.h);
+  cvOverlayCtx.beginPath();
+  contour.forEach((p, i) => i ? cvOverlayCtx.lineTo(p.x, p.y) : cvOverlayCtx.moveTo(p.x, p.y));
+  cvOverlayCtx.closePath();
+  cvOverlayCtx.stroke();
 }
 
-// Capture a full-res JPEG cropped to the detected item (with padding), for the model.
-function captureCropped(bbox) {
+// Capture a full-res JPEG of just the item: crop to its bbox, then clip to the
+// silhouette so everything outside the contour becomes a flat distinctive background.
+function captureMasked(region) {
   const vw = video.videoWidth, vh = video.videoHeight;
+  const kx = vw / CVW, ky = vh / CVH, pad = 0.15;
   let sx = 0, sy = 0, sw = vw, sh = vh;
+  const bbox = region && region.bbox;
   if (bbox) {
-    const kx = vw / CVW, ky = vh / CVH, pad = 0.15;
     sx = bbox.x * kx; sy = bbox.y * ky; sw = bbox.w * kx; sh = bbox.h * ky;
     sx = Math.max(0, sx - sw * pad); sy = Math.max(0, sy - sh * pad);
     sw = Math.min(vw - sx, sw * (1 + 2 * pad)); sh = Math.min(vh - sy, sh * (1 + 2 * pad));
   }
   capCanvas.width = Math.round(sw); capCanvas.height = Math.round(sh);
-  capCanvas.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, capCanvas.width, capCanvas.height);
-  return { dataUrl: capCanvas.toDataURL('image/jpeg', 0.8), thumb: makeThumb() };
+  const ctx = capCanvas.getContext('2d');
+  ctx.fillStyle = MASK_BG;
+  ctx.fillRect(0, 0, capCanvas.width, capCanvas.height);
+  const pts = region && region.contour;
+  if (pts && pts.length > 2) {
+    ctx.save();
+    ctx.beginPath();
+    pts.forEach((p, i) => {
+      const px = p.x * kx - sx, py = p.y * ky - sy;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.closePath();
+    ctx.clip();
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, capCanvas.width, capCanvas.height);
+    ctx.restore();
+  } else {
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, capCanvas.width, capCanvas.height);
+  }
+  return { dataUrl: capCanvas.toDataURL('image/jpeg', 0.85), thumb: makeThumb() };
 }
 // ===================================================================================
 
@@ -315,9 +368,9 @@ const recalibBtn = document.getElementById('recalibBtn');
 
 // Open the explicit "point at the empty table" prompt; detection is suspended until set.
 function startCalibration() {
-  emptyBaseline = null;
-  if (cvBaseline) { cvBaseline.delete(); cvBaseline = null; }
-  lastBBox = null;
+  cvCalibrated = false;
+  if (bgSub) { bgSub.delete(); bgSub = null; }
+  lastRegion = null;
   armed = true;
   stableCount = 0;
   stage = 'IDLE';
@@ -332,8 +385,7 @@ document.getElementById('setBaselineBtn').addEventListener('click', () => {
   if (video.readyState < 2) return;
   if (!cvReady) { statusEl.textContent = "OpenCV still loading — try again in a moment"; return; }
   cvSetBaseline();
-  lastCapturedFrame = null;
-  lastBBox = null;
+  lastRegion = null;
   armed = true;
   stableCount = 0;
   stage = 'IDLE';
@@ -432,15 +484,16 @@ function checkMotion() {
 
   const det = cvDetect();
   if (!det) return;                       // OpenCV not ready yet
-  const { present, still, bbox } = det;
-  lastBBox = bbox;
+  const { present, still, bbox, contour } = det;
+  const region = { bbox, contour };
+  if (present) lastRegion = region;
 
-  // No baseline yet — the explicit calibration prompt (#calib) is showing.
-  if (!cvBaseline) { drawOverlay(null); return; }
+  // Not calibrated yet — the explicit calibration prompt (#calib) is showing.
+  if (!cvCalibrated) { drawOverlay(null); return; }
 
   const overlayState = stage === 'AWAIT_FLIP' ? 'settling'
                      : (armed && present && still) ? 'settling' : 'ready';
-  drawOverlay(present ? bbox : null, overlayState);
+  drawOverlay(present ? contour : null, overlayState);
 
   if (!armed) {
     // Locked after a scan. Re-arm when the item LEAVES (blob gone = table clear).
@@ -473,7 +526,7 @@ function checkMotion() {
       stableCount++;
       statusEl.textContent = `other side holding still… ${stableCount}/${STABLE_NEEDED}`;
       statusEl.className = "settling";
-      if (stableCount >= STABLE_NEEDED) { stableCount = 0; captureSide2AndAnalyze(bbox); }
+      if (stableCount >= STABLE_NEEDED) { stableCount = 0; captureSide2AndAnalyze(region); }
     }
     return;
   }
@@ -498,7 +551,7 @@ function checkMotion() {
         statusEl.className = "calling";
       } else {
         stableCount = 0;
-        captureSide1(bbox);
+        captureSide1(region);
       }
     }
   }
@@ -506,9 +559,9 @@ function checkMotion() {
 
 function loop() { requestAnimationFrame(loop); }
 
-// Side 1: capture (cropped to the detected item) and hold — no Gemini call yet.
-function captureSide1(bbox) {
-  side1Capture = captureCropped(bbox);
+// Side 1: capture (masked to the detected item) and hold — no Gemini call yet.
+function captureSide1(region) {
+  side1Capture = captureMasked(region);
 
   stage = 'AWAIT_FLIP';
   flipMotionSeen = false;
@@ -519,15 +572,15 @@ function captureSide1(bbox) {
   statusEl.className = "settling";
 }
 
-// Side 2: capture (cropped), then send both photos to Gemini together for one decision.
-async function captureSide2AndAnalyze(bbox) {
+// Side 2: capture (masked), then send both photos to Gemini together for one decision.
+async function captureSide2AndAnalyze(region) {
   processing = true;
   statusEl.textContent = "📸 analyzing both sides…";
   statusEl.className = "calling";
   flashEl.classList.add('go');
   setTimeout(() => flashEl.classList.remove('go'), 300);
 
-  const cap2 = captureCropped(bbox);
+  const cap2 = captureMasked(region);
   const side1 = side1Capture;
 
   // Reset the flip sequence now — a failed call means starting the sequence over,
