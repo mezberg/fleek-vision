@@ -1,5 +1,7 @@
 # Fleek Vision — live donation-table sorter
 
+Demo: https://drive.google.com/file/d/1mCl3YWhia35flpGbVoFUgSCCe8XOfMAd/view?usp=sharing
+
 A single-file web app that watches a charity donation intake table through a phone
 camera, detects when an item is placed down, and uses an AI vision model
 (via OpenRouter) to identify it and flag likely high-resale-value pieces.
