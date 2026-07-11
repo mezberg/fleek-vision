@@ -290,10 +290,10 @@ function tone(freq, startOffset, dur, type, peak) {
 }
 
 // KEEP = rising chime · DISCARD = low buzzer · high value = sparkle · flip = quick up-blip
-function keepSound()    { ensureAudio(); tone(659, 0, 0.16, "sine", 0.30);   tone(988, 0.15, 0.30, "sine", 0.30); }
-function discardSound() { ensureAudio(); tone(196, 0, 0.22, "square", 0.22); tone(147, 0.20, 0.34, "square", 0.22); }
-function highEmphasis() { ensureAudio(); tone(1319, 0, 0.16, "sine", 0.28);  tone(1319, 0.20, 0.22, "sine", 0.28); }
-function flipCueBeep()  { ensureAudio(); tone(880, 0, 0.10, "sine", 0.25);   tone(990, 0.12, 0.12, "sine", 0.25); }
+function keepSound()    { ensureAudio(); tone(659, 0, 0.16, "sine", 0.60);   tone(988, 0.15, 0.30, "sine", 0.60); }
+function discardSound() { ensureAudio(); tone(196, 0, 0.22, "square", 0.45); tone(147, 0.20, 0.34, "square", 0.45); }
+function highEmphasis() { ensureAudio(); tone(1319, 0, 0.16, "sine", 0.55);  tone(1319, 0.20, 0.22, "sine", 0.55); }
+function flipCueBeep()  { ensureAudio(); tone(880, 0, 0.10, "sine", 0.50);   tone(990, 0.12, 0.12, "sine", 0.50); }
 
 function checkMotion() {
   // Keep analyzing the scene at all times. We do NOT stop for an in-flight Gemini
