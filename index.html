@@ -171,11 +171,16 @@ function verdictOf(r) {
 badge.addEventListener('click', () => historyEl.classList.add('show'));
 document.getElementById('histClose').addEventListener('click', () => historyEl.classList.remove('show'));
 
-// avg per-pixel (red channel) difference between two 80x60 frames
+// avg per-pixel difference across R,G,B between two 80x60 frames.
+// Using all three channels (not just red) catches items that contrast with the
+// background in green/blue too — red-only missed those. Divided by 3 so the scale
+// stays "average per-channel", keeping the existing thresholds valid.
 function frameDiff(a, b) {
   let sum = 0;
-  for (let i = 0; i < a.length; i += 4) sum += Math.abs(a[i] - b[i]);
-  return sum / (a.length / 4);
+  for (let i = 0; i < a.length; i += 4) {
+    sum += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+  }
+  return sum / (a.length / 4) / 3;
 }
 
 // grab the current camera frame as an 80x60 sample
