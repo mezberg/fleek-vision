@@ -244,7 +244,9 @@ function doubleBeepHigh() {
 }
 
 function checkMotion() {
-  if (paused || cooling || processing || video.readyState < 2) return;
+  // Keep analyzing the scene at all times. We do NOT stop for an in-flight Gemini
+  // call — we only avoid starting a second call (handled at the capture step below).
+  if (paused || video.readyState < 2) return;
 
   diffCtx.drawImage(video, 0, 0, 80, 60);
   const frame = diffCtx.getImageData(0, 0, 80, 60).data;
@@ -265,9 +267,11 @@ function checkMotion() {
       // Locked after a scan. Re-arm when the item LEAVES (frame diverges from what we
       // just captured) — a relative check, so camera auto-exposure drift can't wedge it.
       if (still && lastCapturedFrame && frameDiff(frame, lastCapturedFrame) >= PRESENCE_THRESH) {
+        // The scene changed from what we scanned (item removed OR swapped for another).
+        // Just re-arm — do NOT touch emptyBaseline here, or a swapped-in item would be
+        // mistaken for the empty background and could never be detected.
         armed = true;
         stableCount = 0;
-        emptyBaseline = frame;               // item's gone — re-anchor "empty" to right now
         statusEl.textContent = "watching for an item…";
         statusEl.className = "";
       } else {
@@ -294,13 +298,18 @@ function checkMotion() {
       statusEl.textContent = `holding still… ${stableCount}/${STABLE_NEEDED}`;
       statusEl.className = "settling";
       if (stableCount >= STABLE_NEEDED) {
-        stableCount = 0;
         // Similarity backstop: if it looks like the item we just logged, skip it.
         if (lastCapturedFrame && frameDiff(frame, lastCapturedFrame) < DUP_THRESH) {
+          stableCount = 0;
           armed = false;
           statusEl.textContent = "✓ same item — remove for next";
           statusEl.className = "";
+        } else if (processing) {
+          // A previous analysis is still running — keep watching, don't call Gemini again yet.
+          statusEl.textContent = "⏳ analyzing previous…";
+          statusEl.className = "calling";
         } else {
+          stableCount = 0;
           captureAndAnalyze(frame);
         }
       }
@@ -313,7 +322,6 @@ function loop() { requestAnimationFrame(loop); }
 
 async function captureAndAnalyze(smallFrame) {
   processing = true;
-  cooling = true;
   statusEl.textContent = "📸 analyzing…";
   statusEl.className = "calling";
   flashEl.classList.add('go');
@@ -339,10 +347,8 @@ async function captureAndAnalyze(smallFrame) {
   }
 
   processing = false;
-  setTimeout(() => {
-    cooling = false;
-    if (armed) { statusEl.textContent = "watching for an item…"; statusEl.className = ""; }
-  }, COOLDOWN_MS);
+  // If still armed (e.g. the call errored), reset the prompt so it can try again.
+  if (armed) { statusEl.textContent = "watching for an item…"; statusEl.className = ""; }
 }
 
 // A small JPEG thumbnail of the current capture, for the history list.
