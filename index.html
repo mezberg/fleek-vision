@@ -64,7 +64,8 @@
   .hItem { display:flex; gap:12px; padding:10px; margin-bottom:8px; border-radius:12px;
            background:rgba(255,255,255,0.06); align-items:center; }
   .hItem.high { background:rgba(180,40,40,0.35); }
-  .hItem img { width:56px; height:56px; object-fit:cover; border-radius:8px; flex:none; }
+  .hItem .thumbs { display:flex; gap:4px; flex:none; }
+  .hItem .thumbs img { width:40px; height:56px; object-fit:cover; border-radius:6px; }
   .hItem .info { flex:1; min-width:0; }
   .hItem .info .t { font-weight:600; font-size:15px; }
   .hItem .info .s { font-size:13px; opacity:0.8; margin-top:2px; }
@@ -133,6 +134,10 @@ let armed = true;               // false after a capture until the table is clea
 let apiKey = "";
 const history = [];
 
+let stage = 'IDLE';             // 'IDLE' (watching for side 1) | 'AWAIT_FLIP' (side 1 captured, waiting for side 2)
+let side1Capture = null;        // { dataUrl, thumb } for the first side, held until side 2 is ready
+let flipMotionSeen = false;     // true once motion has been seen since side 1 — proves an actual flip happened
+
 const badge = document.getElementById('badge');
 const badgeCount = document.getElementById('badgeCount');
 const historyEl = document.getElementById('history');
@@ -161,6 +166,9 @@ function startCalibration() {
   emptyBaseline = null;
   armed = true;
   stableCount = 0;
+  stage = 'IDLE';
+  side1Capture = null;
+  flipMotionSeen = false;
   calibEl.classList.add('show');
   statusEl.textContent = "calibrating — aim at the empty table";
   statusEl.className = "";
@@ -172,6 +180,9 @@ document.getElementById('setBaselineBtn').addEventListener('click', () => {
   lastCapturedFrame = null;
   armed = true;
   stableCount = 0;
+  stage = 'IDLE';
+  side1Capture = null;
+  flipMotionSeen = false;
   calibEl.classList.remove('show');
   statusEl.textContent = "✓ baseline set — place an item";
   statusEl.className = "";
@@ -243,6 +254,21 @@ function doubleBeepHigh() {
   setTimeout(() => beep(true), 350);
 }
 
+function flipCueBeep() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  [880, 990].forEach((freq, i) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = freq;
+    const t = ctx.currentTime + i * 0.12;
+    gain.gain.setValueAtTime(0.25, t);
+    osc.start(t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+    osc.stop(t + 0.12);
+  });
+}
+
 function checkMotion() {
   if (paused || cooling || processing || video.readyState < 2) return;
 
@@ -278,6 +304,39 @@ function checkMotion() {
       return;
     }
 
+    if (stage === 'AWAIT_FLIP') {
+      if (tableEmpty) {
+        // Item removed instead of flipped — abandon side 1 and go back to watching.
+        stage = 'IDLE';
+        side1Capture = null;
+        flipMotionSeen = false;
+        stableCount = 0;
+        emptyBaseline = frame;
+        statusEl.textContent = "watching for an item…";
+        statusEl.className = "";
+      } else if (!still) {
+        // Motion while an item is still present — this is the flip happening.
+        flipMotionSeen = true;
+        stableCount = 0;
+        statusEl.textContent = "flip in progress…";
+        statusEl.className = "settling";
+      } else if (!flipMotionSeen) {
+        // Still, but nothing has moved since side 1 yet — keep prompting.
+        statusEl.textContent = "✓ side 1 captured — 🔄 now flip the item";
+        statusEl.className = "settling";
+      } else {
+        stableCount++;
+        statusEl.textContent = `other side holding still… ${stableCount}/${STABLE_NEEDED}`;
+        statusEl.className = "settling";
+        if (stableCount >= STABLE_NEEDED) {
+          stableCount = 0;
+          captureSide2AndAnalyze(frame);
+        }
+      }
+      prevFrame = frame;
+      return;
+    }
+
     if (!still) {
       stableCount = 0;
       statusEl.textContent = "watching for an item…";
@@ -301,7 +360,7 @@ function checkMotion() {
           statusEl.textContent = "✓ same item — remove for next";
           statusEl.className = "";
         } else {
-          captureAndAnalyze(frame);
+          captureSide1(frame);
         }
       }
     }
@@ -311,10 +370,28 @@ function checkMotion() {
 
 function loop() { requestAnimationFrame(loop); }
 
-async function captureAndAnalyze(smallFrame) {
+// Side 1: just capture and hold — no Gemini call yet, we need side 2 first.
+function captureSide1(smallFrame) {
+  capCanvas.width = video.videoWidth;
+  capCanvas.height = video.videoHeight;
+  const ctx = capCanvas.getContext('2d');
+  ctx.drawImage(video, 0, 0);
+  side1Capture = { dataUrl: capCanvas.toDataURL('image/jpeg', 0.7), thumb: makeThumb() };
+
+  stage = 'AWAIT_FLIP';
+  flipMotionSeen = false;
+  flashEl.classList.add('go');
+  setTimeout(() => flashEl.classList.remove('go'), 300);
+  flipCueBeep();
+  statusEl.textContent = "✓ side 1 captured — 🔄 now flip the item";
+  statusEl.className = "settling";
+}
+
+// Side 2: capture, then send both photos to Gemini together for one combined decision.
+async function captureSide2AndAnalyze(smallFrame) {
   processing = true;
   cooling = true;
-  statusEl.textContent = "📸 analyzing…";
+  statusEl.textContent = "📸 analyzing both sides…";
   statusEl.className = "calling";
   flashEl.classList.add('go');
   setTimeout(() => flashEl.classList.remove('go'), 300);
@@ -323,18 +400,24 @@ async function captureAndAnalyze(smallFrame) {
   capCanvas.height = video.videoHeight;
   const ctx = capCanvas.getContext('2d');
   ctx.drawImage(video, 0, 0);
-  const dataUrl = capCanvas.toDataURL('image/jpeg', 0.7);
-  const thumb = makeThumb();
+  const dataUrl2 = capCanvas.toDataURL('image/jpeg', 0.7);
+  const thumb2 = makeThumb();
+  const side1 = side1Capture;
+
+  // Reset the flip sequence now — a failed call means starting the sequence over,
+  // same as the single-shot version's "leave it armed for a retry" behavior.
+  stage = 'IDLE';
+  side1Capture = null;
+  flipMotionSeen = false;
 
   try {
-    const result = await callGemini(dataUrl);
+    const result = await callGemini(side1.dataUrl, dataUrl2);
     // Lock onto this item so it won't be re-scanned until the table changes.
     armed = false;
     lastCapturedFrame = smallFrame;
-    addToHistory(result, thumb);
+    addToHistory(result, side1.thumb, thumb2);
     showCard(result);
   } catch (e) {
-    // Leave it armed so a retry can happen without removing the item.
     statusEl.textContent = "error: " + e.message;
   }
 
@@ -354,9 +437,9 @@ function makeThumb() {
   return t.toDataURL('image/jpeg', 0.6);
 }
 
-function addToHistory(r, thumb) {
+function addToHistory(r, thumbFront, thumbBack) {
   const isHigh = r.resale_value_signal === "high";
-  history.unshift({ r, thumb, isHigh });
+  history.unshift({ r, thumbFront, thumbBack, isHigh });
   badgeCount.textContent = history.length;
 
   if (history.length === 1) histList.innerHTML = "";
@@ -365,7 +448,7 @@ function addToHistory(r, thumb) {
   const brand = r.brand && r.brand !== "unknown" ? r.brand : "";
   const meta = [brand, r.condition, r.pattern_color].filter(Boolean).join(" · ");
   el.innerHTML =
-    `<img src="${thumb}" alt="">` +
+    `<div class="thumbs"><img src="${thumbFront}" alt=""><img src="${thumbBack}" alt=""></div>` +
     `<div class="info"><div class="t">${escapeHtml(r.category || "item")}</div>` +
     `<div class="s">${escapeHtml(meta)}</div>` +
     (isHigh ? `<div class="tag">⭐ HIGH VALUE — ${escapeHtml(r.value_reasoning || "")}</div>` : "") +
@@ -377,19 +460,19 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 }
 
-const PROMPT = `You are looking at a single frame from a live camera feed above a charity donation intake table. A garment has just been placed down. Identify:
+const PROMPT = `You are looking at two photos of the SAME garment from a live camera feed above a charity donation intake table — the item was flipped between shots, so the first photo shows one side and the second shows the other. Using both photos together, identify:
 - category
 - condition: one of "new", "like new", "good", "fair", "poor"
-- brand: only if a visible logo/tag is present, else "unknown"
-- brand_evidence: what you saw, or "none"
+- brand: only if a visible logo/tag is present in either photo, else "unknown"
+- brand_evidence: what you saw and in which photo, or "none"
 - pattern_color: short description
-- resale_value_signal: "high", "medium", or "low" — "high" means this item shows signs a typical volunteer sorter would miss but a vintage/resale buyer would value: recognizable designer/premium brand, vintage construction, band/graphic tees, deadstock/new-with-tags condition, rare colorways, notable sports/collectible merchandise. Most ordinary donated clothing is "low".
+- resale_value_signal: "high", "medium", or "low" — "high" means this item shows signs a typical volunteer sorter would miss but a vintage/resale buyer would value: recognizable designer/premium brand, vintage construction, band/graphic tees, deadstock/new-with-tags condition, rare colorways, notable sports/collectible merchandise, or a label visible in either photo. Most ordinary donated clothing is "low".
 - value_reasoning: one short sentence, or "none"
 
 Return ONLY JSON, no markdown fences:
 {"category":"...", "condition":"...", "brand":"...", "brand_evidence":"...", "pattern_color":"...", "resale_value_signal":"...", "value_reasoning":"..."}`;
 
-async function callGemini(dataUrl) {
+async function callGemini(dataUrl1, dataUrl2) {
   const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -402,7 +485,8 @@ async function callGemini(dataUrl) {
         role: "user",
         content: [
           { type: "text", text: PROMPT },
-          { type: "image_url", image_url: { url: dataUrl } }
+          { type: "image_url", image_url: { url: dataUrl1 } },
+          { type: "image_url", image_url: { url: dataUrl2 } }
         ]
       }]
     })
